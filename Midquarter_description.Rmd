@@ -1,0 +1,463 @@
+---
+title: "STA 141A: Midquarter report"
+author: "Jocelyn Chang"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Overview
+
+The midquarter report helps you start working on the wildfire dataset. The five tasks outline some basic exploratory data analysis to investigate the spatial and temporal patterns in the wildfire dataset. You need to write up your own report.
+
+## Data
+
+The full dataset ([link](https://www.kaggle.com/datasets/rtatman/188-million-us-wildfires/data)) contains 1.88 million entries of wildfires. The dataset of is of 795 MB in size. You can find a smaller subset that contains 100,000 entries on Canvas. You can work on the small subset or the full dataset as you see fit. You can load the 100k data using the following code. Detailed description of variables in the dataset is available on Kaggle.
+
+I also requested some data from the [NOAA](https://www.ncei.noaa.gov/access/monitoring/wildfires/) looking at 5 states with either high fire size or fire count: Kansas, California, Nevada, Georgia, and Texas. There are 3 weather stations for the 5 states, each in different major cities of the overall state. The dataset contains a little over 100k entries, spanning 1992-2015, adjusted to the first wildfire dataset implemented by the professor. A description of the variables in the [dataset](https://drive.google.com/file/d/1SYw3ipYghvctdo_Ht4ii-BAc8yYUEYIG/view?usp=sharing) is available on this on the [NOAA metadata](https://www.ncei.noaa.gov/products/land-based-station/global-historical-climatology-network-daily?utm_source=chatgpt.com), via this [document](https://www.ncei.noaa.gov/data/global-historical-climatology-network-daily/doc/GHCND_documentation.pdf).
+
+```{r}
+library(tidyverse)
+library(scales)
+library(lubridate)
+library(maps)
+library(viridis)
+#i need to add weather
+
+wildfires <-read.csv(file = "../Data/wildfires_sample_100k.csv")
+weather <-read.csv(file = "../Data/weather.csv")
+
+
+```
+
+------------------------------------------------------------------------
+
+#### Task 0: Combining the Dataset
+
+```{r}
+station_to_state <- c("CARSON CITY, NV US" = "NV",
+                      "RENO AIRPORT, NV US" = "NV",
+                      "MCCARRAN INTERNATIONAL AIRPORT, NV US" = "NV",
+                      "TOPEKA FORBES FIELD, KS US" = "KS",
+                      "DODGE CITY REGIONAL AIRPORT, KS US" = "KS",
+                      "WICHITA DWIGHT D. EISENHOWER NATIONAL AIRPORT, KS US" = "KS",
+                      "ATLANTA HARTSFIELD JACKSON INTERNATIONAL AIRPORT, GA US" = "GA",
+                      "COLUMBUS METROPOLITAN AIRPORT, GA US" = "GA",
+                      "SAVANNAH HILTON HEAD INTERNATIONAL AIRPORT, GA US" = "GA",
+                      "HOUSTON INTERCONTINENTAL AIRPORT, TX US" = "TX",
+                      "AUSTIN BERGSTROM INTERNATIONAL AIRPORT, TX US" = "TX",
+                      "SAN ANTONIO INTERNATIONAL AIRPORT, TX US" = "TX",
+                      "LOS ANGELES INTERNATIONAL AIRPORT, CA US" = "CA",
+                      "SAN DIEGO INTERNATIONAL AIRPORT, CA US" = "CA",
+                      "SAN FRANCISCO INTERNATIONAL AIRPORT, CA US" = "CA")
+
+weather_agg <- weather |> mutate(STATE = recode(NAME, !!!station_to_state), #splicing so i dont need to rewrite all the stations
+    YEAR  = year(ymd(DATE))) |> filter(!is.na(STATE)) |> #drop any unrecognized stations
+  group_by(STATE, YEAR) |> summarise(avg_tmax = mean(TMAX, na.rm = TRUE), #avg daily max temp
+                                     avg_tmin = mean(TMIN, na.rm = TRUE), #avg daily min temp
+                                     total_prcp = sum(PRCP, na.rm = TRUE), #annual total precipitation 
+                                     avg_wind = mean(AWND, na.rm = TRUE), #avg wind speed
+                                     .groups = "drop")
+
+head(weather_agg) #quick check to see if the ds is formatted correctly
+
+target_states <- c("CA", "TX", "GA", "NV", "KS")
+fires_agg <- wildfires|>
+  filter(STATE %in% target_states)|>
+  group_by(STATE, FIRE_YEAR)|>
+  summarise(fire_count  = n(), median_size = median(FIRE_SIZE, na.rm = TRUE), mean_size = mean(FIRE_SIZE, na.rm = TRUE), total_acres = sum(FIRE_SIZE, na.rm = TRUE), .groups = "drop")
+
+merged <- fires_agg |> left_join(weather_agg, by = c("STATE", "FIRE_YEAR" = "YEAR"))
+
+head(merged)
+```
+
+### Task 1 Understanding the Given Dataset
+
+**(a)** Print the number of rows and columns, and list names and data types.
+
+```{r}
+dim(wildfires) #the number of rows and columns
+#dimensions are 100000 rows by 39 columns
+names(wildfires)
+glimpse(wildfires) #this shows the names and the type of data it is
+
+```
+
+**(b)** Identify variables with missing values and any other issues.
+
+```{r}
+missing_summary <- data.frame(column = names(wildfires), n_missing = colSums(is.na(wildfires)), pct_missing = round(100 * colSums(is.na(wildfires)) / nrow(wildfires), 1)) |> filter(n_missing > 0) |> arrange(desc(n_missing))
+missing_summary
+
+
+```
+
+**(c)** Write 4–6 sentences describing your initial impressions and data-quality concerns.
+
+Initially after looking at the data I noticed that some of the variables, like Complex_Name, MTBS_ID, and ICS_209_Incident_number have a very substantial percentage of missing values, around 98%. This might be because they identify and name large incidents, but for smaller fires they won't care to identify and name them. For example, for devastating wildfires like the LA fires, they have a very specific name and ID attatched to them. Additionally, a lot of the local variables like COUNTY, LOCAL_INCIDENT_ID also have a good portion missing, which might make smaller county level analysis more difficult.
+
+------------------------------------------------------------------------
+
+### Task 2 Exploring Temporal Patterns
+
+Use `FIRE_YEAR` and `DISCOVERY_DOY`.
+
+**(a)** Create a new column `FIRE_DATE` from `FIRE_YEAR` and `DISCOVERY_DOY`. (Note: Please ignore the column `DISCOVERY_DATE`.)
+
+```{r}
+wildfires <- wildfires |> mutate(FIRE_DATE = as.Date(paste(FIRE_YEAR, DISCOVERY_DOY, sep = "-"), format = "%Y-%j"))
+
+wildfires |> select(FIRE_DATE,FIRE_YEAR, DISCOVERY_DOY) |> head()
+
+
+```
+
+**(b)** Plot annual number of wildfires by year.
+
+```{r}
+
+annual_counts <- wildfires|>
+  group_by(FIRE_YEAR)|>
+  summarise(n_fires = n(), .groups = "drop")
+
+ggplot(annual_counts, aes(x = FIRE_YEAR, y = n_fires)) +
+  geom_line(color = "darkorange", linewidth = 1) +
+  geom_point(color = "darkorange", size = 2.5) +
+  scale_x_continuous(breaks = seq(1992, 2015, by = 3)) +
+  scale_y_continuous(labels = label_comma()) +
+  labs(title = "Annual Number of Wildfires (1992–2015)", x = "Year", y = "Number of Fires") +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid.minor = element_blank(),
+        plot.title = element_text(face = "bold"))
+
+#there is an increase of fire in 2005-06 area based off this graph
+
+```
+
+**(c)** Plot average fire size per year by year.
+
+```{r}
+#plotting avg fire size, going to do both mean and median because fire size is very right skewed. The mean is being pulled up by outliers and is more sensitive to years that there are extremely large fires that burn thorugh a lot of acres
+
+annual_size <- wildfires |>
+  group_by(FIRE_YEAR) |>
+  summarise(mean_size = mean(FIRE_SIZE, na.rm = TRUE), median_size = median(FIRE_SIZE, na.rm = TRUE),
+    .groups = "drop") |>
+  pivot_longer(cols = c(mean_size, median_size),
+               names_to  = "metric",
+               values_to = "size")
+
+ggplot(annual_size, aes(x = FIRE_YEAR, y = size, color = metric)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  scale_color_manual(
+    values = c(mean_size = "darkorange", median_size = "lightblue"),
+    labels = c("Mean", "Median")) +
+  scale_x_continuous(breaks = seq(1992, 2015, by = 3)) +
+  scale_y_continuous(labels = label_comma()) +
+  labs(
+    title    = "Task 2c: Mean and Median Fire Size per Year (1992–2015)",
+    x = "Year",
+    y = "Fire Size (acres)",
+    color = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid.minor = element_blank(),
+        legend.position = "top",
+        plot.title = element_text(face = "bold"))
+
+```
+
+**(d)** Write 3–5 sentences describing temporal trends.
+
+Around 2006, I see a large spike in the amount of annual wildfires. And for wildfire sizes, I see very large spikes in the years 2004, 2011, and 2012 when looking at the mean. In general, the wildfire sizes are more susceptible to being pulled around compared to median due to outliers, due to years with really catastrophic fires, skewing the model. We can see that the model is being skewed when we compare the mean points of high fire size to the median points of high fire size for the years of 2004, 2011, and 2012. Through the mean, this shows that a typical fire is always small, hovering around 1 acre.
+
+------------------------------------------------------------------------
+
+### Task 3 Exploring Spatial Patterns
+
+**(a)** Create a table of fire counts per `STATE` and report the top 10 states.
+
+```{r}
+
+state_counts <- wildfires |> 
+  count(STATE, sort = TRUE)
+
+top10 <- state_counts |> slice_head(n = 10)
+top10
+
+
+
+```
+
+**(b)** Make a horizontal bar plot of the top 10 states.
+
+```{r}
+ggplot(top10, aes(x = n, y = reorder(STATE, n))) +
+  geom_col(fill = "orange") +
+  geom_text(aes(label = comma(n)), hjust = -0.1, size = 3.5) +
+  scale_x_continuous(labels = comma, expand = expansion(mult = c(0, 0.12))) +
+  labs(title = "Top 10 States by Wildfire Count",
+       x = "Number of Wildfires", y = "State") 
+```
+
+**(c)** Make a scatterplot of ignition points (`LONGITUDE` vs `LATITUDE`).
+
+```{r}
+#w/o the legend
+ggplot(wildfires, aes(x = LONGITUDE, y = LATITUDE, color = STATE)) +
+  geom_polygon(data = map_data("state"),
+               aes(x = long, y = lat, group = group),
+               fill = "blue", color = "white", #borders
+               linewidth = 0.3, inherit.aes = FALSE) +
+  geom_point(alpha = 0.2, size = 0.5) +
+  coord_equal() +
+  labs(title = "Spatial Distribution of Wildfire Ignition Points",
+       x = "Longitude",
+       y = "Latitude") +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+**(d)** Comment briefly on geographic patterns. Optional: you may find it helpful to draw the boundaries of states.
+
+Based on the model above, I see that there are fire clusters across all of US, but mainly concentrate in regional groups. For instance, along the pacific ocean, there is a dense amount of fire ignition points from Washington to California. In addition, the southeast also has a dense concentration of fires in Georgia and Florida. Contastingly, the middle of the US is looking a bit sparse. This makes sense because there is usually less burnable material in the plains and north midwest. By modeling the state borders as well, adjacent neighbors usually tell the same story of fire densities, implying that climate and the topography of the state area are larger predictors compared to policy variance by state.
+
+------------------------------------------------------------------------
+
+### Task 4 Fire Size Distribution
+
+**(a)** Plot a histogram of `FIRE_SIZE` in log scale.
+
+```{r}
+#the professor's code focused on using scale_x_log, and bin size 50, 
+ggplot(wildfires |> filter(FIRE_SIZE > 0), aes(x = FIRE_SIZE)) +
+  geom_histogram(bins = 60, fill = "orange", color = "white", linewidth = 0.2) +
+  scale_x_log10(
+    breaks = c(0.01, 0.1, 1, 10, 100, 1000, 10000, 100000), 
+    labels = comma #going to add these becasue 1e+04 looks worse than just 10000
+  )  +
+  labs(title = "Distribution of Fire Size (in Log Scale)",
+       x = "Fire Size (Acres, Log Scale)", y = "Count")  
+```
+
+**(b)** Create a boxplot of `FIRE_SIZE` by `FIRE_SIZE_CLASS`.
+
+```{r}
+#someting that pops up very obiciously in this box plot (INTERPRET)
+#do a violin plot instead, how many outliers are in the class size A, from the inital graph there are a lot
+#use additional codes if you want; save a copy
+wildfires |>
+  filter(FIRE_SIZE > 0) |> mutate(FIRE_SIZE_CLASS = factor(FIRE_SIZE_CLASS, levels = c("A","B","C","D","E","F","G"))) |>
+  ggplot(aes(x = FIRE_SIZE_CLASS, y = FIRE_SIZE, fill = FIRE_SIZE_CLASS)) +
+  geom_boxplot(outlier.size = 0.5, outlier.alpha = 0.3) +
+  scale_y_log10(labels = comma) +
+  scale_fill_brewer(palette = "YlOrRd") +
+  labs(title = "Fire Size Distribution by Size Class (Log Scale)",
+       x = "Fire Size Class", y = "Fire Size (acres, log scale)") +
+  theme(legend.position = "none")
+
+```
+
+The professor also mentioned a violin model
+
+```{r}
+
+ggplot(wildfires, aes(x = FIRE_SIZE_CLASS, y = FIRE_SIZE)) +
+  geom_violin(fill = "lightblue", alpha = 0.5) +
+  geom_boxplot(fill = "pink", alpha = 0.7, width = 0.2) +
+  scale_y_log10() +
+  labs(title = "Fire Size by Size Class (Violin & Boxplot)",
+       x = "Fire Size Class",
+       y= "Fire Size (acres, log scale)") +
+  theme_minimal()
+
+#violin and also boxplot, this is also facet wrap bc the one with all of them was really cramped
+
+ggplot(wildfires, aes(x = FIRE_SIZE_CLASS, y = FIRE_SIZE)) +
+  geom_violin(fill = "lightblue", alpha = 0.5) +
+  geom_boxplot(fill = "pink", alpha = 0.7, width = 0.2) +
+  scale_y_log10() +
+  facet_wrap(~ FIRE_SIZE_CLASS, scales = "free", nrow = 1) +
+  labs(title = "Fire Size by Size Class (Violin & Boxplot)",
+       x= NULL,
+       y= "Fire Size (acres, log scale)") 
+
+
+```
+
+**(c)** Compute the median, 90th percentile, and 99th percentile of `FIRE_SIZE`.
+
+```{r}
+quantile(wildfires$FIRE_SIZE, probs = c(0.5, 0.9, 0.99, 0.9999999), na.rm = TRUE)
+
+mean(wildfires$FIRE_SIZE)
+
+
+#prog put the group by function here
+#how to handle the heavy tail dist of the wildfires, summary measure, pred model
+#media is snmall, and mean is larger, abt 1000x fire size (what model to pred the widfires)
+```
+
+**(d)** Write 3–4 sentences interpreting the distribution and what it suggests for prediction tasks.
+
+The median is around 1 acre, while the mean is almost 75 times larger because its being pulled (right tail). When we get to the 90th percentile, there are only 17 acres, and by the 99th, there is 480 acres, however the max amount is around 344k acres. So we know that there is heavy right skew; predicting fire count and fire size are two different problems, since the typical fire is always small but an outlier can skew the impact. What this means for real life implementation though, is that mean is important when you want to need to plan resource allocation and disaster impact (what allocation of money, equipment, etc. is needed and where, because a class G fire might consume more resources then all of class A combined).
+
+------------------------------------------------------------------------
+
+### Task 5 Visualizing Fire Size Patterns
+
+**(a)** Create a visualization that illustrates both the spatial and temporal patterns of fire sizes across U.S. states and years. Specifically, construct a heatmap with `STATE` on the y-axis, `FIRE_YEAR` on the x-axis, and the median `FIRE_SIZE` within each state–year combination represented by color intensity.
+
+```{r}
+#reorder states based o nhow close they are to each other on map, not alphabetaxal
+#also do the mean?? for the heat map
+#or look at the 99 percentaile, only the really large fires
+#if large and 99%, sig natural disaster in that state
+
+states_in_data <- unique(wildfires$STATE)
+
+geo_order <- c(
+  "WA","OR","CA","ID","NV","AZ","MT","WY","UT","CO","NM",
+  "ND","SD","NE","KS","OK","TX",
+  "MN","IA","MO","AR","LA",
+  "WI","IL","MS","MI","IN","AL","OH","TN","GA","KY","WV",
+  "VA","NC","SC","FL",
+  "PA","NY","VT","NH","ME","MA","RI","CT","NJ","DE","MD","DC",
+  "AK","HI","PR")
+
+geo_ordered <- geo_order[geo_order %in% states_in_data]
+
+heatmap_data <- wildfires |>
+  group_by(STATE, FIRE_YEAR) |>
+  summarise(
+    median_size = median(FIRE_SIZE, na.rm = TRUE),
+    mean_size = mean(FIRE_SIZE, na.rm = TRUE),
+    p99_size = quantile(FIRE_SIZE, 0.99, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  mutate(STATE = factor(STATE, levels = rev(geo_ordered)))
+
+
+ggplot(heatmap_data, aes(x = FIRE_YEAR, y = STATE, fill = log1p(median_size))) +
+  geom_tile(color = "white", linewidth = 0.15) +
+  scale_fill_viridis_c(
+    option = "inferno",
+    name= "Log Transformed Mean Fire Size",
+    guide = guide_colorbar(barwidth = 10, barheight = 0.5, title.position = "top")
+  ) +
+  scale_x_continuous(breaks = seq(1992, 2015, by = 4)) +
+  labs(title = "Median Fire Size by State and Year",
+    subtitle = "States ordered geographically west to eat",
+    x = "Year", y = NULL) +
+  theme_minimal(base_size = 9) +
+  theme(
+    panel.grid= element_blank(),
+    axis.text.y = element_text(size = 7),
+    legend.position = "bottom",
+    plot.title= element_text(face = "bold"))
+
+
+ggplot(heatmap_data, aes(x = FIRE_YEAR, y = STATE, fill = log1p(mean_size))) +
+  geom_tile(color = "white", linewidth = 0.15) +
+  scale_fill_viridis_c(
+    option = "inferno",
+    name= "Log Transformed Mean Fire Size",
+    guide = guide_colorbar(barwidth = 10, barheight = 0.5,
+                            title.position = "top")
+  ) +
+  scale_x_continuous(breaks = seq(1992, 2015, by = 4)) +
+  labs(
+    title = "Mean Fire Size by State and Year",
+    subtitle = "States ordered geographically west to east",
+    x = "Year", y = NULL
+  ) +
+  theme_minimal(base_size = 9) +
+  theme(
+    panel.grid= element_blank(),
+    axis.text.y = element_text(size = 7),
+    legend.position = "bottom",
+    plot.title= element_text(face = "bold"))
+
+```
+
+Now I am going to do another graph based on the merged dataset.
+
+```{r}
+
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+
+#pivot merged to long format so we can use facet_wrap
+merged_long <- merged |>
+  select(STATE, FIRE_YEAR, mean_size, avg_wind) |>
+  mutate(mean_size = log1p(mean_size)) |> #log transform fire size only
+  pivot_longer(cols = c(mean_size, avg_wind),
+               names_to  = "metric",
+               values_to = "value") |>
+  mutate(metric = recode(metric,
+                         mean_size = "Mean Fire Size (log acres)",
+                         avg_wind = "Avg Wind Speed (mph)"))
+
+ggplot(merged_long, aes(x = FIRE_YEAR, y = STATE, fill = value)) +
+  geom_tile(color = "white", linewidth = 0.4) +
+  scale_fill_viridis_c(option = "inferno") +
+  scale_x_continuous(breaks = seq(1992, 2015, by = 4)) +
+  facet_wrap(~ metric, ncol = 1) +
+  labs(title= "Mean Fire Size vs Avg Wind Speed by State and Year",
+       x = "Year", y = NULL, fill = "Value") +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid  = element_blank(),
+        plot.title  = element_text(face = "bold"),
+        strip.text  = element_text(face = "bold", size = 11))
+
+
+```
+
+**(b)** Briefly interpret the visualization. Your interpretation should describe any noticeable spatial differences across states, temporal trends over years, or other meaningful patterns observed in the plot.
+
+In this modeling, I decided to order the states by their geographic region rather than the default alphabetical because it might show more regional patterns. Also, mean was chosen over the median to better show the outlying, crazier in fire sizes, since the median stays near 1 acre regardless of year. When looking at the first graph, it seems like a lot of the western states have the largest fires the heat map, and was we progress towards the eastern states, the color becomes more dark (smaller and sparser fires). In the merged dataset, composed of both weather and the original wildfires data set, I looked into specifically wind patterns, by making two heat maps side by side. What really stood out to me was that Kansas had the highest wind speeds of the five states, and for the years of Kansas that had pretty large fires, they were also higher average wind speeds we can see this in 1996 as well as 2011. This shows that there might be some type of positive relationship at play between wind speeds and fire size. Temporally, there seems to be less sparseness after 2005, which might indicate that there might be more fires popping up on a more frequent basis then pre-2005.
+
+------------------------------------------------------------------------
+
+### Task 6 Designing Your Own Visualization
+
+**(a)** Create an additional visualization of your own choosing that also highlights spatial and temporal information in fire sizes across states and years.
+
+```{r}
+#install.packages("shiny"), okay this took a lot of figureing out how thigns worked
+library(shiny)
+
+library(ggplot2)
+
+ui <- fluidPage(titlePanel("Wildfire Size vs. Temperature by State and Year"),
+                sliderInput("year", label   = "Select Year:", min = 1992, max= 2015, 
+                            value = 2000, step = 1, animate = TRUE),
+                plotOutput("bubble"))
+
+server <- function(input, output) {output$bubble <- renderPlot({
+  data <- merged[merged$FIRE_YEAR == input$year, ]
+  ggplot(data, aes(x = avg_tmax, y = fire_count,
+                   size = total_acres, color = STATE, label = STATE))+ 
+    geom_point(alpha = 0.7) + geom_text(size = 4, vjust = -1.2, show.legend = FALSE) +
+      scale_size_continuous(range = c(4, 20), labels = scales::label_comma()) +
+      scale_color_manual(values = c(CA = "darkred", TX = "lightblue",
+                                    GA = "darkgreen", NV = "pink",
+                                    KS = "darkorange")) +
+      labs(title = paste("Year:", input$year), x = "Avg Max Temperature (in Fahrenheit)",
+      y = "Number of Fires", size   = "Total Acres Burned", color  = "State") +
+      theme_minimal(base_size = 14) +
+      theme(plot.title = element_text(face = "bold", size = 18))})}
+
+shinyApp(ui = ui, server = server)
+
+
+```
+
+**(b)** Provide a short explanation of (1) why you chose this visualization, and (2) what new or complementary insights it reveals compared to plots from the other tasks.
+
+I initially wanted to do some sort of model with a interactive slider and dropdown menu, where you could switch between weather and fire variables year by year, but the ui was a bit tough to figure out because there was a lot of compenents, so I think I will reattempt in the final version of this project. However, I thought that another really cool visualization would be having a bubble graph, with the size of the bubble as the total acres burned, and also showing how average max temperature and fire count come into play (in the 5 states that I selected in the NoAA dataset: California, Texas, Georgia, Nevada, and Kansas) Each bubble is a state in a given year, and the x-axis shows avg max temperature while y-axis shows fire count, and the size of the bubble is the total acres burned (a larger bubble, more acres burned). In Task 5, where I looked at the median fire size across the 5 states and also took average wind speed into account, showed that Kansas was consistently high winds with larger fires. But didn't look at temperature as well. The bubble model looks into temperature and acres burned, which relates to fire frequency and the severity of it paired with its possible relationship with weather. When I looked into the large bubble sizes, like Texas in 2011, it shows that there was very large fires paired with high heat, which would make a lot of sense. But as I scrolled, I also saw California in 2013, with a very large amount of acres burned despite the temperature being lower than other states around it. This means that there might be other factors that come into play (like droughts, rain levels, etc.) These are things that I would like to explore in the final version of this project. ([Link to video in case it does not show](https://drive.google.com/file/d/1EBOIhhSYYbQ0B9aphQ1RzXoy9_Vttdxl/view?usp=sharing))
