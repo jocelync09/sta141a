@@ -1,0 +1,563 @@
+---
+title: "Final Report: STA141A, Predicting Wildfire Incidence in the United States"
+author: "Jocelyn Chang"
+output: html_document
+---
+
+------------------------------------------------------------------------
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+#improving the readabiltiy for the TAs
+```
+
+## Abstract:
+
+This report develops a prediction model for notable wildfire incidence across the United States using historical fire records from the Fire Program Analysis fire-occurrence database, from 1992 to 2015. I constructed a monthly panel at 1° x 1° spatial resolution, defining a binary outcome that shows whether a notable wildfire (≥300 acres) occurs in a given grid cell in the following month. In addition to the wildfire data, I also included NOAA weather station observations across five high-risk states as additional covariates, created lagged precipitation elements to see the effect of the boom and bust cycle hypothesis. Three models are compared using temporal CV: logistic regression (AUC 0.810), LASSO logistic regression (AUC 0.810), and Random Forest (AUC 0.825). In th eend, Random Forest achieved the best performance by capturing non-linear interactions between geographic location, fire history, and weather conditions. My work shows that historical fire activity and geographic location are the strongest predictors of future fire risk, with weather covariates providing additional insights to see that drives wildfire behavior.
+
+## Data:
+
+This report will contain information from 2 different data sets.
+
+You can find and download a subset of historical wildfire records derived from the Kaggle dataset *“[188 Million US Wildfires](https://www.kaggle.com/datasets/rtatman/188-million-us-wildfires/data)”*. The dataset includes wildfire ignition locations, discovery dates, containment dates, and final burned area across the contiguous United States.
+
+Wildfires vary widely in size, and the vast majority of recorded fires are very small and quickly contained. Modeling all recorded fires would lead to extreme class imbalance and would obscure the dynamics of fires that are operationally and scientifically meaningful.
+
+To address this, I filtered the raw wildfire records to retain only “notable” fires. The cutoff retained only the wildfires with final burned area $\geq$ 300 acres. This threshold is consistent with operational wildfire reporting standards used by U.S. fire management agencies, where *large wildland fires* are commonly defined as: $\geq$ 100 acres in timber fuel models, or $\geq$ 300 acres in grass or brush fuel models
+
+From my midquarter project report, I imported some additional data where I requested some data from the [NOAA](https://www.ncei.noaa.gov/access/monitoring/wildfires/), I looked at 5 states with either high fire size or fire count: Kansas, California, Nevada, Georgia, and Texas. There are 3 weather stations for the 5 states, each in different major cities of the overall state. The dataset contains a little over 100k entries, spanning 1992-2015, adjusted to the first wildfire dataset implemented by the professor. A description of the variables in the [dataset](https://drive.google.com/file/d/1SYw3ipYghvctdo_Ht4ii-BAc8yYUEYIG/view?usp=sharing) is available on this on the [NOAA metadata](https://www.ncei.noaa.gov/products/land-based-station/global-historical-climatology-network-daily?utm_source=chatgpt.com), via this [document](https://www.ncei.noaa.gov/data/global-historical-climatology-network-daily/doc/GHCND_documentation.pdf).
+
+To download the weather data, click [here](https://drive.google.com/file/d/12ls-6jFRglZYt3jKU6PbdP0EuGO3ro5i/view?usp=sharing) or find it in the repo under Data/weather.csv.
+
+## Background:
+
+Over recent years, area burned by wildfires have increased, partially due to a few reasons, rising temperatures, longer drought durations, etc. Therefore, having an accurate way of predicting when and where larger wildfires are likely to break out is one of great importance, can could help aid efforts in resource allocation, preparation, evacuation planning, etc.
+
+This project is focused on developing a prediction model for notable wildfire incidences using the Fire Program Analysis Fire-Occurrence Database, a comprehensive record of wildfires reported across the US from 1992 to 2015. I will be using this data set to predict whether at least one notable wildfire will occur in that cell during the following month. In addition, I have found records with weather observations from NOAA stations across five high fire-risk states (California, Nevada, Kansas, Georgia, and Texas), containing variables like temperature, wind, and precipitation. In particular, I will be exploring the [boom and bust cycle](https://time.com/7205644/los-angeles-california-fires-climate-change/) theory. The idea that prior rainfall promotes greenry growth & "dead leaves, trees and other tinder that gets left behind when things dry" becomes fuel that result in wildfires by looking at lagged precipitation elements and examining their relationship with fire occurrence in the following analysis.
+
+### 1. Data Preprocessing
+
+Step 1: ID and filter the notable fires
+
+Wildfires can vary in size, so a large amount of recorded fires are very small and contained quickly. Because I am trying to predict fires for the purpose of better resource allocation, planning, etc. It makes more sense to only retain notable fires with at least 300 acres burned in the data set. This leads to 25,666 notable fire records left over.
+
+```{r}
+#install.packages("RSQLite")
+#install.packages("DBI")
+#install.packages("pROC")
+#install.packages("slider")
+#install.packages("xgboost")
+setwd("~/Desktop/STA141AW26")
+#getwd()
+library(DBI)
+library(RSQLite)
+
+con <- dbConnect(SQLite(), "Data/FPA_FOD_20170508.sqlite")
+
+wildfires <- dbReadTable(con, "Fires")
+dbDisconnect(con) #alr loaded data
+library(dplyr)
+
+suppressMessages({
+    library(dplyr)
+    library(ggplot2)
+    library(tidyverse)
+    library(slider)
+    library(pROC)
+    library(scales)
+    library(lubridate)
+    library(maps)
+    library(viridis)
+    library(xgboost)
+    library(Matrix)
+    library(DBI)
+    library(RSQLite)})
+
+weather <- read.csv("Data/weather.csv")
+
+
+#dates for the ds
+fires <- wildfires |> mutate(FIRE_DATE = as.Date(paste(FIRE_YEAR, DISCOVERY_DOY, sep = "-"), format = "%Y-%j"), YEAR = year(FIRE_DATE), MONTH = month(FIRE_DATE))
+
+#filter for the 300 acre thres
+imp_threshold_acres <- 300
+imp_fires <- fires |> filter(FIRE_SIZE >= imp_threshold_acres)
+
+nrow(imp_fires)
+```
+
+Step 2. Space & Time
+
+Each fire is assigned to a 1° × 1° grid cell (squares) so I can predict whether each square will have a fire next month. Having these grid cells allow for modeling to be small but capture geographic variation in fire risk.
+
+```{r}
+#spatial & time
+imp_fires <- imp_fires |>
+  mutate(lat_bin = floor(LATITUDE), lon_bin = floor(LONGITUDE), ym = YEAR * 100 + MONTH) 
+```
+
+Step 3. Panel building
+
+Making it so we count the amount of fires per square per month. In addition, for squares with no fires that month have a 0 rather than a blank space, so it isn't counted as missing data. This is important so I can determine what is fire versus non-fire conditions. Therefore, Grid cell-months with no recorded fires receive n_fires = 0 and fire_this_month = 0.
+
+```{r}
+# grid x month
+grid_month_fire <- imp_fires |> group_by(lat_bin, lon_bin, ym) |>
+  summarise(n_fires = n(), .groups = "drop") |>
+  mutate(fire_this_month = 1L)
+
+head(grid_month_fire) 
+
+# full panel
+all_grids <- grid_month_fire |> distinct(lat_bin, lon_bin)
+
+start_date <- ymd(paste0(min(grid_month_fire$ym) %/% 100, "-", min(grid_month_fire$ym) %% 100, "-01"))
+end_date <- ymd(paste0(max(grid_month_fire$ym) %/% 100, "-",max(grid_month_fire$ym) %% 100, "-01"))
+
+all_months <- tibble(date = seq.Date(start_date, end_date, by = "month")) |>
+  mutate(year = year(date), 
+         month = month(date), 
+         ym = year * 100 + month) |>
+  select(ym, year, month)
+
+panel <- crossing(all_grids, all_months) |>
+  left_join(grid_month_fire, by = c("lat_bin", "lon_bin", "ym")) |>
+  mutate(n_fires = replace_na(n_fires, 0L),
+         fire_this_month = replace_na(fire_this_month, 0L))
+
+glimpse(panel)
+```
+
+Step 4. Binary Variable
+
+y_next shows whether at least one notable fire occurs in a given grid cell in the *next* month. This way, I can predicting future fire occurrence from current conditions.
+
+```{r}
+#next month, pred future fires
+panel <- panel |> arrange(lat_bin, lon_bin, ym) |>
+  group_by(lat_bin, lon_bin) |>
+  mutate(y_next = lead(fire_this_month, n = 1L)) |>
+  ungroup() |>
+  filter(!is.na(y_next))
+
+table(panel$y_next)
+```
+
+Step 5. Predictors
+
+A lot of predictors are being created:
+
+1.  Geographic: lat_bin, lon_bin, and state are used to capture the spatial location of each grid cell
+2.  Seasonal: using sine and cosine transformations to capture the cyclical pattern of seasons
+3.  Fire history: using lad to find the historical fire behavior of each grid cell: number after lag represents the fire count n months prior. (ex. fire_lag12 is the fire count exactly 12 months prior, number after fire_roll represents the rolling sums of fire counts, number after size_roll is the rolling sums of total burned area. All these factors allow me to see fire risk across time.
+
+```{r}
+#state to grid
+mode_state <- function(x) {
+  names(sort(table(x), decreasing = TRUE))[1]}
+
+grid_state <- imp_fires |>
+  group_by(lat_bin, lon_bin) |>
+  summarise(state = mode_state(STATE), .groups = "drop")
+
+panel <- panel |>
+  left_join(grid_state, by = c("lat_bin", "lon_bin"))
+
+panel |> select(state) |> summary()
+
+#season
+panel <- panel |>
+  mutate(month_sin = sin(2 * pi * month/ 12),
+         month_cos = cos(2 * pi * month /12))
+
+panel |> select(month_sin, month_cos) |> head()
+
+grid_fire_size <- imp_fires |>
+  group_by(lat_bin, lon_bin, ym) |>
+  summarise(fire_size = sum(FIRE_SIZE), .groups = "drop")
+
+panel <- panel |>
+  left_join(grid_fire_size, by = c("lat_bin", "lon_bin", "ym")) |>
+  mutate(fire_size = coalesce(fire_size, 0))
+
+panel <- panel |>
+  arrange(lat_bin, lon_bin, ym) |>
+  group_by(lat_bin, lon_bin) |>
+  mutate(fire_lag12 = lag(n_fires, 12),
+         fire_roll3 = slide_dbl(n_fires, sum, .before = 2, .complete = FALSE),
+         fire_roll12 = slide_dbl(n_fires, sum, .before = 11, .complete = FALSE),
+         size_roll3 = slide_dbl(fire_size, sum, .before = 2, .complete = FALSE),
+         size_roll12 = slide_dbl(fire_size, sum, .before = 11, .complete = FALSE)) |>
+  ungroup()
+
+panel |>
+  select(n_fires, fire_lag12, fire_roll3, fire_roll12, 
+         size_roll3, size_roll12) |>
+  summary()
+
+glimpse(panel) 
+```
+
+Step 6. Adding weather
+
+Adding monthly weather observations from 15 NOAA stations across California, Nevada, Kansas, Georgia, and Texas. Each state-month will have maximum and minimum temperature, total precipitation, and average wind speed. Also, there is also lagged precipitation elements to capture the boom and bust cycle.
+
+```{r}
+station_to_state <- c("CARSON CITY, NV US" = "NV",
+                      "RENO AIRPORT, NV US" = "NV",
+                      "MCCARRAN INTERNATIONAL AIRPORT, NV US" = "NV",
+                      "TOPEKA FORBES FIELD, KS US" = "KS",
+                      "DODGE CITY REGIONAL AIRPORT, KS US" = "KS",
+                      "WICHITA DWIGHT D. EISENHOWER NATIONAL AIRPORT, KS US" = "KS",
+                      "ATLANTA HARTSFIELD JACKSON INTERNATIONAL AIRPORT, GA US" = "GA",
+                      "COLUMBUS METROPOLITAN AIRPORT, GA US" = "GA",
+                      "SAVANNAH HILTON HEAD INTERNATIONAL AIRPORT, GA US" = "GA",
+                      "HOUSTON INTERCONTINENTAL AIRPORT, TX US" = "TX",
+                      "AUSTIN BERGSTROM INTERNATIONAL AIRPORT, TX US" = "TX",
+                      "SAN ANTONIO INTERNATIONAL AIRPORT, TX US" = "TX",
+                      "LOS ANGELES INTERNATIONAL AIRPORT, CA US" = "CA",
+                      "SAN DIEGO INTERNATIONAL AIRPORT, CA US" = "CA",
+                      "SAN FRANCISCO INTERNATIONAL AIRPORT, CA US" = "CA") #from last mid qtr report
+
+weather_agg <- weather |>
+  mutate(state = recode(NAME, !!!station_to_state),#splicing so i dont need to rewrite all the stations
+         DATE = ymd(DATE),
+         year = year(DATE),
+         month = month(DATE),
+         ym= year * 100 + month) |>
+  filter(!is.na(state)) |>
+  group_by(state, ym, year, month) |>
+  summarise(
+    avg_tmax = mean(TMAX, na.rm = TRUE), #avg daily max temp
+    avg_tmin = mean(TMIN, na.rm = TRUE),#avg daily min temp
+    total_prcp = sum(PRCP,  na.rm = TRUE), #annual total precipitation 
+    avg_wind = mean(AWND, na.rm = TRUE), #avg wind speed
+    .groups = "drop") |>
+  #lag rain
+  arrange(state, ym) |>
+  group_by(state) |>
+  mutate(prcp_lag1= lag(total_prcp, 1), #prev month rain
+         prcp_lag3= lag(total_prcp, 3), #3 month prior
+         prcp_lag6= lag(total_prcp, 6), #6 month prior
+         prcp_roll3 = slide_dbl(total_prcp, mean, .before = 2, .complete = FALSE)) |>
+  ungroup()
+
+
+
+panel <- panel |>
+  left_join(weather_agg, by = c("state", "ym", "year", "month"))
+
+```
+
+Step 7. Summary table describing the final data set
+
+Final data set has 282695 monthly grid cell observations from 1992 to 2015, with 20 predictors and a binary outcome showing whether there is a notable fire occurrence in the following month.
+
+```{r}
+final_df <- panel |>
+  mutate(y_next = factor(y_next, levels = c(0, 1))) |>
+  select(y_next, lat_bin, lon_bin, state,
+         month_cos, month_sin, year,
+         n_fires, fire_lag12, fire_roll3, fire_roll12,
+         size_roll3, size_roll12,
+         avg_tmax, avg_tmin, total_prcp, avg_wind, #weather add
+         prcp_lag1, prcp_lag3, prcp_lag6, prcp_roll3)  #lag precip
+
+# summary table based off of discussion
+dataset_summary <- tibble(
+  n_rows = nrow(final_df),
+  year_min = min(panel$year),
+  year_max = max(panel$year),
+  spatial_unit = "1° x 1° lat-lon grid (floor bins)",
+  temporal_unit = "monthly",
+  outcome = "y_next = 1 if any notable fire occurs in grid cell next month",
+  predictors = "lat_bin, lon_bin, state, month_cos, month_sin, year,
+    n_fires, fire_lag12, fire_roll3, fire_roll12, size_roll3, size_roll12, avg_tmax,
+  avg_tmin, total_prcp, avg_wind, prcp_lag1, prcp_lag3, prcp_lag6, prcp_roll3") 
+
+
+dataset_summary
+```
+
+### 2. Exploratory Data Analysis
+
+Plot 1: Spatial Map: How does wildfire incidence vary across space?
+
+The US has different conditions depending on the region you are in, like climate zones, crop types, etc. This plot shows fire risk is heavily concentrated in the western states, particularly California and the Northwest area, while the eastern US shows much lower rates, except for Florida.
+
+```{r}
+#spatical
+eda_spatial <- panel |>
+  group_by(lat_bin, lon_bin) |>
+  summarise(fire_rate = mean(y_next == 1), .groups = "drop")
+
+ggplot(eda_spatial, aes(x = lon_bin, y = lat_bin, fill = fire_rate)) +
+  geom_tile() +
+  scale_fill_viridis(option = "inferno",
+                     labels = scales::percent) + #making things percentage so its easier to read
+  coord_quickmap() + #from discussion, i took out the xlim = c(-125, -65), ylim = c(25, 50) bc it didnt include alaska and hawaii
+  labs(title = "Spatial distribution of notable wildfire risk",
+       subtitle = "Mean probability of a notable fire next month by grid cell",
+       x = "Longitude", y = "Latitude", fill = "Mean y_next") +
+  theme_minimal()
+```
+
+Plot 2: Seasonality graph: How important is the season for wildfires?
+
+Fire behavior is affected by factors like temperature, humidity, greenery dryness, which are all impacted by the seasonal cycles. So fire risk would likely vary by time of year. This plot shows a peak in June & July, which are hot and dry summer conditions. Additionally, there is also some movement in Feburary and March, which is interesting.
+
+```{r}
+#seasons
+eda_month <- panel |>
+  group_by(month) |>
+  summarise(mean_y_next = mean(y_next == 1), .groups = "drop")
+
+ggplot(eda_month, aes(x = month, y = mean_y_next)) +
+  geom_line(linewidth = 1, color = "darkred") +
+  geom_point(size = 3, color = "darkred") +
+  geom_area(alpha = 0.1, fill = "darkred") + #under the curve shadeing
+  scale_x_continuous(breaks = 1:12,
+                     labels = c("Jan","Feb","Mar","Apr","May","Jun",
+                                "Jul","Aug","Sep","Oct","Nov","Dec")) +
+  scale_y_continuous(labels = scales::percent) + #percentage 
+  labs(title = "Seasonality of notable wildfire incidence",
+       subtitle = "Mean probability of a notable fire in the following month",
+       x = "Month", y = "Mean of y_next") + theme_minimal()
+```
+
+Plot 3: Precipitation bar chart: How do predictors differ between fire and non-fire observations?
+
+From the boom and bust cycle theory, prior rainfall is hypothesized to influence fire risk. To see if this is a possible effect, I compared the fire rates across precipitation 3 months prior. The grid cells in Q2 how the highest fire rate, rather than the driest quartile (Q1). This is pretty consistent with the boom and bust cycle hypothesis, that some prior rainfall promotes greenery growth which later dries into fuel for fires. And that an extreme drought would stop greenery growth completely, leaving less fuel for the fires. This non-linear relationship shows that I should use lagged precipitation as a predictor.
+
+```{r}
+#theory the prof was talking about that after rain there is a larger fire (googled and it was the boom and bust cycle thry)
+panel |>
+  filter(!is.na(prcp_lag3)) |>
+  mutate(prcp_bucket = ntile(prcp_lag3, 4),
+         prcp_label = case_when(
+           prcp_bucket == 1 ~ "Very dry (Q1)",
+           prcp_bucket == 2 ~ "Dry (Q2)",
+           prcp_bucket == 3 ~ "Wet (Q3)",
+           prcp_bucket == 4 ~ "Very wet (Q4)"
+         ),
+         prcp_label = factor(prcp_label,
+                             levels = c("Very dry (Q1)", "Dry (Q2)",
+                                        "Wet (Q3)", "Very wet (Q4)"))) |>
+  group_by(prcp_label) |>
+  summarise(fire_rate = mean(y_next == 1), .groups = "drop") |>
+  ggplot(aes(x = prcp_label, y = fire_rate, fill = prcp_label)) +
+  geom_col(show.legend = FALSE) +
+  geom_text(aes(label = scales::percent(fire_rate, accuracy = 0.1)), vjust = -0.5, size = 4) + #adding percentage
+  scale_fill_brewer(palette = "RdYlBu", direction = -1) +
+  scale_y_continuous(labels = scales::percent, expand = expansion(mult = c(0, 0.1))) +  #labels
+  labs(title = "Prior precipitation and wildfire risk",
+       subtitle = "Fire rate by precipitation quartile 3 months prior",
+       x = "Precipitation level (3 months prior)",
+       y = "Mean fire rate (y_next = 1)") +
+  theme_minimal()
+```
+
+Plot 4: Year chart: Are there trends in wildfires over time?
+
+Climate change [research](https://www.c2es.org/content/wildfires-and-climate-change/#:~:text=Wildfires%20are%20becoming%20more%20frequent,the%20rate%20of%20fire%20spread.) shows that increasing temperatures have more frequent droughts that increase wildfires overtime. To see if this is true, I plotted mean monthly fire probability by year. The plot shows that there is a positive trend from 1992 to 2015, with some variability form year to year. But overall, mean monthly fire probability goes from \~3.5% in 1992 to 6.2% in 2015, showing that there is an increasing wildfire risk over the study period
+
+```{r}
+#year trend
+eda_year <- panel |>
+  group_by(year) |>
+  summarise(mean_y_next = mean(y_next == 1), .groups = "drop")
+
+ggplot(eda_year, aes(x = year, y = mean_y_next)) +
+  geom_line(linewidth = 1, color = "darkorange") +
+  geom_point(size = 2, color = "darkorange") +
+  geom_smooth(method = "lm", se = TRUE, 
+              color = "black", linetype = "dashed") +
+  scale_y_continuous(labels = scales::percent) +
+  labs(title = "Trend in notable wildfire incidence over time",
+       subtitle = "Mean probability of a notable fire in the following month by year",
+       x = "Year", y = "Mean of y_next") +
+  theme_minimal()
+```
+
+### 3. Modeling
+
+**Baseline: Logistic Regression**
+
+-   Logistic Regression, models the log-odds of a notable fire occurring next month as a linear combination of all predictors. Logistic regression is easy to understand which predictors are associated with increased fire risk.
+
+$$\log\left(\frac{p}{1-p}\right) = \beta_0 + \sum_{j=1}^{20} \beta_j x_j$$
+
+where $p = P(y_{\text{next}} = 1 \mid x)$ and $x_j$ represents each of the 20 predictors.
+
+**Additional Model: LASSO**
+
+-   Since we have a lot of predictors, 20, I thought that using a LASSO model might be interesting to see which ones were more important. It's also a model format I'm familiar with because of STA108, so I thought that it would be interesting to apply it here as well. LASSO adds a penalty term that shrinks coefficients from unimportant predictors exactly to zero
+
+$$-\ell(\beta) + \lambda \sum_{j=1}^{20} |\beta_j|$$
+
+where $\lambda$ controls the strength of regularization and is selected by cross validation (CV). Weak predictors are shrunk exactly to zero.
+
+**Additional Model: RandomForest**
+
+-   The third model is a Random Forest. Each tree is trained on a bootstrap sample of the training data, and predictions are averaged across all trees. This especially good for the work I've done so far because
+
+    -   The non-linear relationship between prior precipitation and fire risk observed in Section 2 suggests a linear model may be insufficient to capture the full effort
+
+    -   Random Forest naturally captures interactions between predictors such as temperature and drought without requiring a lot of tweaking
+
+$$\hat{p}_i = \frac{1}{B} \sum_{b=1}^{B} T_b(x_i)$$
+
+where $T_b$ is the $b$-th decision tree trained on bootstrap sample $b$ and $B$ is the total number of trees.
+
+```{r}
+glimpse(final_df) #in the discussion notes, but i alr wrote it in
+
+#for log regression in the base,
+log_reg <- y_next ~ lat_bin + lon_bin + state + month_cos + month_sin + year +
+  n_fires + fire_lag12 + fire_roll3 + fire_roll12 + size_roll3 + size_roll12 +
+  avg_tmax + avg_tmin + total_prcp + avg_wind + prcp_lag1 + prcp_lag3 + prcp_lag6 + prcp_roll3
+
+
+library(glmnet)
+library(randomForest)
+
+```
+
+### 4. Model Fitting and Validation
+
+Time-aware CV:
+
+Since standard CV just randomly puts data into folds, this would be bad for the modeling that I want to tain from past years to predict the future. And if it was random, then there is a chance of the reverse happening (this is a form of data leakage). Instead, for each validation year, the model is only trained on prior years and tested on the year that was held. This ensures that the ordering of the data is how the model would actually be used in real life (predicting future fires from past observations!)
+
+AUC:
+
+Area Under the ROC curve is the primary performance metric I can going to use. It measures the how well the model separates fire months from nonfire months (so a score of 1.0 means perfect separation, and 0.5 means the model is basically randomly guessing). The data set is heavily imbalanced (15350/282695) \~5% of observations are fires. AUC avoids this problem by measuring how well the model ranks fire versus nonfire observations regardless of how rare fires are.
+
+Best Performance:
+
+Random Forest achieves the highest mean AUC of 0.825, outperforming both logistic regression (0.810) and LASSO (0.810). The plot shows Random Forest consistently above both linear models across most year. Which makes sense because there are non-linear interactions between predictors (geographic location, fire history, and weather conditions). LASSO and logistic regression perform nearly the same, which makes sense because LASSO retains all 20 predictors, showing that there are no predictors that are redundant. All three models struggle in 2006 to 2007 and 2009 to 2010, which means that there were probably unusual fire seasons driven by factors not captured in my predictors. In addition for predictors, the Gini plot I have shows that areas that burned once are likely to burn again, with fire history as the strongest predictor. Geographic location is the second most important, and weather is the third (but all variables entered from weather are in the top15), showing that NOAA weather data adds good predictive elements.
+
+```{r}
+
+years_sorted <- sort(unique(final_df$year))
+min_train_years <- 3
+set.seed(9)
+
+#time cv, dont use furture data to pred the past 
+fold_results <- tibble(
+  train_end_year = years_sorted[(min_train_years):(length(years_sorted) - 2)],
+  valid_year = years_sorted[(min_train_years + 1):(length(years_sorted) - 1)]
+) |> #log reg, split tain and validation sets by yr
+  mutate(auc_glm = map2_dbl(train_end_year, valid_year, function(tr_end, va_year) {
+      train <- final_df |> filter(year <= tr_end) |> drop_na()
+      valid <- final_df |> filter(year == va_year) |> drop_na()
+      #fitting log reg with all 20 pred
+      fit <- glm(log_reg, data = train, family = binomial, na.action = na.exclude)
+      p_hat <- predict(fit, newdata = valid, type = "response")
+      #auc calc, how well model ranks fire v. nonfire months
+      roc_obj <- roc(response = valid$y_next, predictor = p_hat, quiet = TRUE)
+      as.numeric(auc(roc_obj))}),
+#LASSO
+        auc_lasso = map2_dbl(train_end_year, valid_year, function(tr_end, va_year) {
+      train <- final_df |> filter(year <= tr_end) |> drop_na()
+      valid <- final_df |> filter(year == va_year) |> drop_na()
+      #uses matric instead of formula, state into dummy variables
+      X_train <- model.matrix(log_reg, data = train)[, -1]
+      y_train <- as.numeric(as.character(train$y_next))
+      X_valid <- model.matrix(log_reg, data = valid)[, -1]
+      #finding opt lambda via cv
+      cv_fit <- cv.glmnet(X_train, y_train, 
+                          family = "binomial", alpha = 1, nfolds= 5,
+                          type.measure = "auc")
+      p_hat <- predict(cv_fit, newx = X_valid, s = "lambda.min", type = "response")[, 1]
+      roc_obj <- roc(response = valid$y_next, predictor = p_hat, quiet = TRUE)
+      as.numeric(auc(roc_obj))}),
+#random forest
+    auc_rf = map2_dbl(train_end_year, valid_year, function(tr_end, va_year) {
+      train <- final_df |> filter(year <= tr_end) |> drop_na()
+      valid <- final_df |> filter(year == va_year) |> drop_na()
+      fit <- randomForest(log_reg, data = train, ntree = 100, mtry  = 4) #100 trees
+      p_hat <- predict(fit, newdata = valid, type = "prob")[, "1"]
+      roc_obj <- roc(response = valid$y_next, predictor = p_hat, quiet = TRUE)
+      as.numeric(auc(roc_obj))}))
+
+fold_results
+
+#AUC over time
+fold_long <- fold_results |>
+  pivot_longer(cols = c(auc_glm, auc_rf, auc_lasso),
+               names_to = "model",
+               values_to = "auc") |>
+  mutate(model = recode(model,
+                        "auc_glm" = "Logistic Regression",
+                        "auc_rf"= "Random Forest",
+                        "auc_lasso" = "LASSO"))
+#long so i can plot on the same. axes
+ggplot(fold_long, aes(x = valid_year, y = auc, color = model)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  geom_hline(yintercept = 0.5, linetype = "dashed", 
+             color = "gray", alpha = 0.7) +  # shows random baseline
+  scale_y_continuous(limits = c(0.5, 1),        # anchors at 0.5 (random guessing)
+                     labels = scales::number_format(accuracy = 0.01)) +
+   scale_color_manual(values = c("Logistic Regression" = "red",
+                                "LASSO" = "blue", 
+                                "Random Forest" = "green"))
+  labs(title = "Time-aware cross-validation: AUC by validation year",
+       x = "Validation year",
+       y = "AUC", color = "Model") + theme_minimal()
+
+
+#fiting final random forest on all data to imp estimates
+final_rf <- randomForest(log_reg,
+                         data = final_df |> drop_na(), ntree = 100,
+                         mtry = 4, importance = TRUE)
+
+#ploting top 15 pred w/ gini (if the gini is higher that its more important for splitting the trees)
+importance(final_rf) |> as.data.frame() |> rownames_to_column("predictor") |>
+  arrange(desc(MeanDecreaseGini)) |> head(15) |> 
+  mutate(category = case_when(
+    predictor %in% c("lat_bin", "lon_bin", "state") ~ "Geographic",
+    predictor %in% c("month_sin", "month_cos", "year") ~ "Temporal",
+    predictor %in% c("n_fires", "fire_lag12", "fire_roll3", 
+                     "fire_roll12", "size_roll3", "size_roll12") ~ "Fire history",
+    TRUE ~ "Weather")) |>
+  ggplot(aes(x = reorder(predictor, MeanDecreaseGini), y = MeanDecreaseGini, fill = category)) + geom_col() +
+  coord_flip() + labs(title = "Random Forest feature importance",
+       subtitle = "Top 15 predictors by mean decrease in Gini impurity",
+       x = "Predictor", y = "Mean Decrease Gini") + theme_minimal()
+
+
+cat("Mean AUC for Logistic Regression:", round(mean(fold_results$auc_glm), 4), "\n")
+cat("Mean AUC for LASSO:", round(mean(fold_results$auc_lasso), 4), "\n")
+cat("Mean AUC for Random Forest:", round(mean(fold_results$auc_rf), 4), "\n")
+
+#seeing which pred lasso picked versus zeroed out
+X_full <- model.matrix(log_reg, data = final_df |> drop_na())[, -1]
+y_full <- as.numeric(as.character(final_df |> drop_na() |> pull(y_next)))
+cv_full <- cv.glmnet(X_full, y_full, family = "binomial", alpha = 1)
+
+
+#non-zero coef
+lasso_coefs <- coef(cv_full, s = "lambda.min")
+nonzero <- lasso_coefs[lasso_coefs[,1] != 0, , drop = FALSE]
+nonzero
+```
+
+### 5. Summary
+
+*EDA Findings:*
+
+The exploratory analysis showed 4 main patterns in notable wildfire incidence across the US (1992–2015). Fire risk is heavily concentrated in the western United States, particularly California, Nevada, and the Northwestern US states, reflecting the dry Mediterranean and semi-arid climate conditions in those regions. Peak fire risk is in June and July, which is consistent with the hot dry weather conditions that summer brings, and a smaller. [February to March](https://climate.ncsu.edu/fire/learn/climatology/#:~:text=Between%20mid%2DMarch%20and%20mid,dry%20airmass%20with%20gusty%20winds.), which could be due to the spring fire season. Areas with moderately dry conditions 3 months prior show have the highest fire frequency, consistent with the boom and bust cycle hypothesis. And notable wildfire incidence shows a clear upward trend which is consistent with broader climate trends linking rising temperatures and intensifying drought to increased wildfire activity.
+
+*What the Models Capture:*
+
+Three models were fit to predict whether a notable wildfire would occur in a given grid cell in the following month. The baseline logistic regression achieved a mean AUC of 0.810, demonstrating that even a simple linear model captures substantial predictive signal from fire history, geography, and seasonality. LASSO logistic regression achieved a nearly identical AUC of 0.810 and retained all 20 predictors. Random Forest achieved the highest mean AUC of 0.825, outperforming both linear models consistently across most validation years. The improvement reflects the ability of Random Forest to capture non-linear interactions between predictors (between geographic location, fire history, and weather conditions), that linear models can't fully represent.
+
+*Predictors and Scientific Interpretation:*
+
+Fire history variables dominate predictions, with the 12-month rolling fire size variable as the single most important predictor, followed by geographic locations. This confirms that where and at what degree of severity fires have burned before is the strongest predictor for future fire risk. In additional, all the NOAA weather covariates (wind speed, temperature, and precipitation) were in the top 15 predictors, showing that the external weather data also played a good part in prediction. The positive coefficient on prcp_lag3 in the LASSO model is also consistent with the boom and bust cycle pattern identified in EDA.
+
+*Limitations:*
+
+Several limitations should be noted. Weather data is restricted to 15 NOAA stations across five states, meaning grid cells outside California, Nevada, Kansas, Georgia, and Texas have no weather covariates. Additionally, the slight improvement of Random Forest over logistic regression (0.825 vs 0.810) suggests that geography and fire history alone explain most of the predictable variation in fire risk. In the future, I could incorporate gridded weather data with national coverage, like PRISM, to provide weather covariates for all grid cells rather than just the five states covered by the NOAA stations.
