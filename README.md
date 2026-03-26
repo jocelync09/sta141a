@@ -30,7 +30,9 @@ Random Forest
 Data:
 The FPA-FOD SQLite database is too large to include in this repository. 
 Download it from Kaggle: https://www.kaggle.com/datasets/rtatman/188-million-us-wildfires
-Weather Data: In this repo
+
+Weather Data: The link in the Final Report will not work
+Instead, download from this link: https://drive.google.com/file/d/1pCM0DdP9ZgGO5PBgqhHnTrufAuzrJg5O/view?usp=sharing
 
 
 
